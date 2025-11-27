@@ -1,10 +1,10 @@
 # Write-Ahead Log (WAL) Design
 
-**Implementation Note:** This library is implemented in Zig and provides a C-compatible API for cross-language use. The design document describes the C API interface; the Zig implementation may use idiomatic Zig constructs internally while maintaining full C ABI compatibility.
-
 ## Overview
 
 This document defines a generic Write-Ahead Log (WAL) system. The WAL provides crash recovery and durability guarantees for storage systems that modify persistent resources (pages, objects, records, etc.). The design is intentionally generic and can be adapted to various use cases including databases, key-value stores, object storage, and file systems.
+
+**Implementation Note:** This library is implemented in Zig and exposed as a shared library with C-compatible interfaces. All documented structures and functions (except opaque handles like `WAL`, `WALTxn`, `WALIterator`) are ABI-compatible with C and follow the C calling convention.
 
 ## Design Principles
 
@@ -14,7 +14,7 @@ This document defines a generic Write-Ahead Log (WAL) system. The WAL provides c
 4. **Idempotent Recovery:** Redo operations can be safely applied multiple times
 5. **Independent System:** Self-contained with no external dependencies
 6. **Lock-Free Append:** Double-buffered design with active writer tracking for safe concurrent appends
-7. **Single-File Storage:** Append-only file with automatic compaction after checkpoint
+7. **Segment-Based Storage:** Log rotation enables bounded segment sizes and easy retirement
 8. **Flexible Resource Identification:** Generic 64-bit resource IDs support any addressing scheme
 9. **ACID Transactions:** Full transaction support with undo/redo recovery via prev_lsn chains
 10. **Production-Grade Durability:** Directory fsync, torn write protection, sector-aligned flushes
@@ -179,63 +179,78 @@ struct ObjUpdatePayload {
 
 ## WAL File Format
 
-### File Naming
+### Segment Naming
 
-WAL uses a single file named `wal.log` in the specified directory.
+WAL uses multiple segment files with sequential numbering:
+
+- `wal.0001` - First segment
+- `wal.0002` - Second segment (created after first segment reaches size limit)
+- `wal.0003` - Third segment, etc.
 
 **Benefits:**
 
-- Simpler implementation (no segment rotation complexity)
-- Automatic compaction after checkpoint keeps file size bounded
-- Single file descriptor reduces resource usage
+- Bounded file sizes (easier filesystem management)
+- Simple retirement of old segments after checkpoint
+- Sequential numbering simplifies recovery ordering
 
-### File Header
+### Segment Header
 
-The WAL file begins with a 4KB header:
+Each segment file begins with a 4KB header:
 
 ```c
-struct WALFileHeader {
-    u32 magic;                   // 0x57414C46 ("WALF")
+struct WALSegmentHeader {
+    u32 magic;                   // 0x57534547 ("WSEG")
     u32 version;                 // WAL format version (1)
+    u32 segment_num;             // Sequential segment number (1, 2, 3, ...)
     u8 payload_hash_type;        // Default payload hash (0=xxHash64, 1=BLAKE2s)
     u8 record_alignment;         // Record alignment (8 bytes)
-    u8 _reserved[6];             // Reserved for future use
+    u8 _reserved[2];             // Reserved for future use
 
-    u64 min_lsn;                 // First LSN in file (updated after compaction)
-    u64 max_lsn;                 // Last LSN written (updated on each flush)
-    u64 file_size;               // Current file size in bytes (updated on each flush)
+    u64 min_lsn;                 // First LSN in this segment
+    u64 max_lsn;                 // Last LSN (updated on rotate/close)
+    u64 segment_size;            // Current segment size in bytes (including header)
 
-    u64 safe_lsn;                // Last checkpoint LSN (compaction boundary)
-    u64 max_file_size;           // File size hint for compaction trigger
+    // WAL-wide configuration (enables recovery without state file)
+    u64 segment_max_size;        // Max segment size before rotation (e.g., 1GB)
     u32 buffer_size;             // Deprecated (use WAL_RECORDS = 8192)
+    u32 retention_mode;          // WALRetentionMode enum
+    u64 retention_param;         // LSN range or segment count
 
     u32 checksum;                // CRC-32C of header (excluding this field)
-    u8 _pad[4040];               // Pad to 4096 bytes
+    u8 _pad[4028];               // Pad to 4096 bytes
 };
-_Static_assert(sizeof(struct WALFileHeader) == 4096, "Header must be 4096 bytes");
+_Static_assert(sizeof(struct WALSegmentHeader) == 4096, "Header must be 4096 bytes");
 ```
 
 **Key Fields:**
 
-- **min_lsn:** First LSN in file (updated after compaction to safe_lsn + 1)
-- **max_lsn:** Last LSN written (updated on every flush)
-- **file_size:** Current file size including header (updated on every flush)
-- **safe_lsn:** Last checkpoint LSN, records ≤ safe_lsn are safe to discard
-- **max_file_size:** Size hint for when to trigger compaction (advisory, not enforced)
-- **payload_hash_type:** Default hash algorithm for records in this file
+- **min_lsn:** First LSN written to this segment (set on creation)
+- **max_lsn:** Last LSN written (updated on rotation or close)
+- **segment_size:** Current segment size including header (file offset)
+- **payload_hash_type:** Default hash algorithm for records in this segment
   - Records can override this per-record using their own `payload_hash_type` field
+  - Segment-level setting provides a default for WAL creation
+  - Allows migration between hash algorithms across segment boundaries
+
+**WAL Configuration Fields (for stateless recovery):**
+
+- **segment_max_size:** Copied from WAL struct, used to validate consistency across segments
+- **buffer_size:** Deprecated field (always use `WAL_RECORDS = 8192`)
+- **retention_mode:** Segment retention policy (enum `WALRetentionMode`)
+- **retention_param:** Policy parameter (LSN range or segment count)
 
 **Recovery without state file:**
 
-- Open `wal.log` and read header
-- Extract configuration from header (min_lsn, max_lsn, payload_hash_type)
-- Compute `next_lsn` = max_lsn + 1
+- Scan directory for all `wal.%08d` files
+- Read latest segment header to extract WAL configuration
+- Validate all segments have compatible config
+- Compute `next_lsn` = max(`max_lsn`) across all segments + 1
 
-### File Layout
+### Segment Layout
 
 ```
 ┌─────────────────────────────────────┐
-│ WAL File Header (4KB)               │  ← Offset 0
+│ WAL Segment Header (4KB)            │  ← Offset 0
 ├─────────────────────────────────────┤
 │ WAL Record 1                        │  ← Offset 4096
 │   [WALRecordHeader][Payload]        │
@@ -255,143 +270,126 @@ _Static_assert(sizeof(struct WALFileHeader) == 4096, "Header must be 4096 bytes"
 
 ## WAL API
 
-### Data Structures
+### Opaque Handles
+
+**Note:** The following handles are **opaque to C clients**. Users only interact via pointers and should never access internal fields directly.
 
 ```c
-// Queue data element (heap-allocated record with metadata)
-struct CQData {
-    u64 lsn;           // LSN of this record
-    u64 size;          // Record size in bytes
-    u8 data[];         // Variable-length record data
-};
-
-// Copyable Queue (MPSC queue holding heap-allocated records)
-struct CQueue {
-    atomic_u64 head;              // Next slot to allocate (multi-producer)
-    atomic_u64 size;              // Current queue size
-    u64 tail;                     // Next slot to consume (single-consumer)
-    u64 cap;                      // Queue capacity
-    struct CQData *_Atomic slots[]; // Array of record pointers
-};
-
-// Ring buffer for aligned writes (flusher-only, serial access)
-struct RingBuf {
-    u64 head;          // Write position
-    u64 tail;          // Read position
-    u64 size;          // Current bytes in buffer
-    u64 mask;          // Capacity - 1 (for power-of-2 wraparound)
-    u8 data[];         // Variable-length buffer data
-};
-
+// OPAQUE: WAL handle - main entry point for all WAL operations
+// Fields documented for implementation reference only, not accessible from C API
 struct WAL {
-    // File management
-    i32 fd;                             // File descriptor for wal.log
+    // Segment management
+    i32 active_fd;                      // File descriptor for active segment
     i32 dirfd;                          // Directory FD for openat()
-    u64 max_file_size;                  // File size hint for compaction trigger
+    u32 segment_num;                    // Current segment number
+    u64 segment_max_size;               // Max segment size before rotation (e.g., 1GB)
     u8 payload_hash_type;               // Default payload hash (0=xxHash64, 1=BLAKE2s)
-    char *wal_dir;                      // Directory containing wal.log
-    struct WALFileHeader *header;       // Cached file header (heap-allocated)
+    char *wal_dir;                      // Directory containing segment files
+    struct WALSegmentHeader *active_shdr; // Cached active segment header (heap-allocated)
 
-    // Double-buffered MPSC queues (hold heap-allocated CQData records)
-    struct CQueue *buffers[2];          // Two queues for ping-pong (capacity: WAL_RECORDS)
+    // Double-buffered MPSC queues (hold heap-allocated records)
+    void *buffers[2];                   // Two queues for ping-pong (capacity: WAL_RECORDS)
     atomic_u32 active_idx;              // Which queue is active (0 or 1)
     atomic_u32 active_writers[2];       // Count of threads writing to each queue
     u32 buffer_size;                    // Deprecated (use WAL_RECORDS instead)
 
     // Ring buffer for aligned writes (serial, flusher-only)
-    struct RingBuf *rb;                 // Accumulates bytes, handles 512-byte alignment
+    void *rb;                           // Accumulates bytes, handles 512-byte alignment
 
     // LSN management
     atomic_u64 next_lsn;                // Next LSN to assign (monotonic)
     atomic_u64 flushed_lsn;             // Last LSN guaranteed on disk
-    u64 safe_lsn;                       // Last checkpoint LSN (for compaction)
+    u64 last_checkpoint_lsn;            // Last checkpoint LSN
 
     // Flush coordination
     atomic_u32 flush_in_progress;       // Prevents concurrent flushes
     pthread_mutex_t flush_mutex;        // Serializes flush operations
     pthread_cond_t flush_cond;          // Notifies threads waiting for flush
 
-    // Compaction state
-    bool compaction_needed;             // Compaction pending after checkpoint
-    u32 compaction_retry_count;         // Failed compaction attempts
+    // Retention policy
+    enum WALRetentionMode retention_mode;
+    union {
+        u64 retention_lsn_range;        // For WAL_RETAIN_LSN
+        u32 retention_count;            // For WAL_RETAIN_COUNT
+    };
 };
+
+// OPAQUE: Transaction handle - used for transactional operations
+struct WALTxn;
+
+// OPAQUE: Iterator handle - used for sequential WAL traversal
+struct WALIterator;
 ```
 
-**Design Notes:**
+**Implementation Architecture:**
 
-- **CQueue (Copyable Queue):** Double-buffered MPSC queues hold heap-allocated records
-  - `CQData` struct stores LSN + size + record data (malloc'd on append)
-  - Append thread: build record → assign LSN → `cq_put()` (copies to heap)
-  - Flusher: `cq_pop()` → copy to ring buffer → free `CQData`
-  - Capacity: `WAL_RECORDS` (8192 slots), swap at `WAL_SWAP_THRES` (~90% = 7372)
-  - Atomic head/size for multi-producer, non-atomic tail for single-consumer
+The WAL implementation uses several key design patterns (implementation details in Zig):
 
-- **Ring Buffer:** True circular buffer for 512-byte aligned writes
-  - Power-of-2 sized with mask-based wraparound (no modulo)
-  - Only flusher accesses (no concurrency, serial)
-  - Accumulates dequeued records, handles wraparound automatically
-  - Writes aligned portions (rounds up to 512-byte boundary with zero padding)
-  - No compaction needed (true circular buffer)
+- **Double-buffered MPSC queues:** Enable lock-free append while flushing
+  - Heap-allocated records avoid size limits
+  - Capacity: 8192 slots, swap at ~90% to prevent write failures
+  - Atomic operations for multi-producer, single-consumer flusher
 
-- **Lock-free append:** Multiple threads can append concurrently
-  - Atomic `next_lsn` for LSN assignment (`FADD`)
-  - `cq_put()` atomically reserves slot and stores `CQData` pointer
-  - No buffer space reservation race conditions (all-or-nothing enqueue)
+- **Ring buffer:** Handles 512-byte sector alignment for durability
+  - Power-of-2 sizing with mask-based wraparound
+  - Serial access (flusher only), no concurrency overhead
+  - Zero-padding to sector boundaries prevents torn writes
 
-- **File header metadata:** No state file required
-  - All WAL configuration stored in file header
-  - Recovery reads file header to extract config
-  - `min_lsn`, `max_lsn`, `safe_lsn`, `max_file_size`, `buffer_size`
-  - Header updated on every flush
+- **Lock-free append:** Maximizes throughput for concurrent writers
+  - Atomic LSN assignment + MPSC enqueue (no locks)
+  - All-or-nothing enqueue prevents partial record corruption
 
-- **Compaction:** Automatic after checkpoint
-  - Create new file with records where lsn > safe_lsn
-  - Atomic rename to replace old file
-  - Blocks flushes during compaction (appends continue)
+- **Stateless recovery:** No separate state files needed
+  - All configuration embedded in segment headers
+  - Scan directory to rebuild WAL state on startup
+  - Absolute segment numbering simplifies ordering
 
-### Core Operations
+- **Automatic rotation:** Triggered when segment reaches size limit
+  - Keeps files manageable for filesystem operations
+  - Enables clean retirement after checkpoints
+
+### Public Core Operations
 
 ```c
-// Create new WAL directory with wal.log file
-// wal_dir: directory to store wal.log (e.g., "/data/wal")
+// Create new WAL directory with initial segment
+// wal_dir: directory to store segment files (e.g., "/data/wal")
 // buffer_size: deprecated (uses WAL_RECORDS = 8192 internally)
-// max_file_size: size hint for compaction trigger (e.g., 1GB)
+// segment_max_size: max segment size before rotation (e.g., 1GB)
 // payload_hash_type: default payload hash (0=xxHash64, 1=BLAKE2s)
 // Returns: WAL handle, or NULL on error
 // Note: Queue capacity is WAL_RECORDS (8192), swap threshold is WAL_SWAP_THRES (~90%)
-WAL* wal_create(const char *wal_dir, u32 buffer_size, u64 max_file_size,
+WAL* wal_create(const char *wal_dir, u32 buffer_size, u64 segment_max_size,
                 u8 payload_hash_type);
 
-// Open existing WAL directory (opens wal.log)
+// Open existing WAL directory (finds latest segment)
 WAL* wal_open(const char *wal_dir);
 
-// Append non-transactional record to WAL (lock-free, non-blocking)
+// Append record to WAL (lock-free, non-blocking)
+// For transactional appends, use wal_txn_append() instead
 // Returns LSN assigned to this record
 // NOTE: Record is in-memory only until wal_flush() is called
-// NOTE: For transactional records, use wal_txn_append() instead
 u64 wal_append(WAL *wal, u64 resource_id, u16 record_type,
                const void *payload, u16 payload_len);
 
-// Force all buffered records to disk (blocks until fsync completes)
+// Force WAL to disk up to specified LSN (blocks until fsync completes)
 // Triggers buffer swap and writes inactive buffer to disk
-// Updates file header with new max_lsn and file_size
-i32 wal_flush(WAL *wal);
+i32 wal_flush(WAL *wal, u64 up_to_lsn);
 
-// Close WAL (flushes any buffered records, updates file header)
+// Close WAL (flushes any buffered records, updates segment header)
 void wal_close(WAL *wal);
 ```
 
-### Recovery Operations
+### Public Recovery Operations
 
 ```c
-// Iterator for reading WAL records sequentially from file
-// IMPORTANT: Iterator MUST enforce LSN ordering even though records may be
-//            physically out of order in file (due to lock-free append).
+// OPAQUE: Iterator handle for reading WAL records sequentially across all segments
+// IMPORTANT: Iterator enforces LSN ordering even though records may be
+//            physically out of order in segment files (due to lock-free append).
 //            Implementation uses a min-heap to read records in strict LSN order.
 struct WALIterator;
 
 // Create iterator starting from specified LSN
-// Reads all records from file, builds min-heap ordered by LSN
+// Reads all records from segments, builds min-heap ordered by LSN
 // Memory usage: O(N) where N = total records in WAL
 WALIterator* wal_iter_create(WAL *wal, u64 start_lsn);
 
@@ -413,20 +411,28 @@ typedef i32 (*wal_apply_fn)(const struct WALRecordHeader *hdr,
                             void *user_ctx);
 
 // Recover by replaying WAL from start_lsn
-// Reads file, calls apply_fn for each record in LSN order
+// Scans all segments in order, calls apply_fn for each record
 // User is responsible for implementing idempotency checking
 i32 wal_recover(WAL *wal, u64 start_lsn, wal_apply_fn apply_fn, void *user_ctx);
 ```
 
-### Checkpoint and Compaction
+### Public Checkpoint and Segment Management
 
 ```c
-// Write generic checkpoint record and update safe_lsn
+// Write generic checkpoint record
 // checkpoint_data: opaque user data describing checkpoint state
 // data_len: length of checkpoint data
 // Returns LSN of checkpoint record
-// NOTE: Sets safe_lsn and marks compaction_needed = true
 u64 wal_checkpoint(WAL *wal, const void *checkpoint_data, u32 data_len);
+
+// Retire old segment files that are no longer needed
+// safe_lsn: LSN before which all data is durable (from checkpoint)
+// Deletes all segments where max_lsn < safe_lsn
+i32 wal_retire_segments(WAL *wal, u64 safe_lsn);
+
+// List all segment files in WAL directory (for recovery/inspection)
+// Returns array of segment numbers, sorted ascending
+i32 wal_list_segments(WAL *wal, u32 **out_segments, u32 *out_count);
 ```
 
 ---
@@ -469,48 +475,27 @@ The WAL uses double-buffered MPSC queues to eliminate buffer space reservation r
 - **No torn records:** Complete record enqueued before swap can occur
 - **Variable-size records:** Heap allocation handles any size
 
-### Flush Protocol with CQueue and RingBuf
+### Flush Protocol
 
-**Flush Phases:**
+**High-Level Phases:**
 
-1. Acquire flush mutex (serialize flushes, not appends)
-2. Set `flush_in_progress` flag with Release semantics
-3. Swap active queue atomically
-4. Dequeue records from inactive queue and accumulate in ring buffer
-   - Track maximum LSN seen
-   - Free records after copying to ring buffer
-5. Flush ring buffer to file with 512-byte alignment
-   - Use 16KB staging buffer
-   - Zero-pad to sector boundary
-   - Count data only, not padding
-6. Update file header with new `max_lsn`, `file_size`, and checksum
-7. Write header to offset 0
-8. Update `flushed_lsn` atomically with Release semantics
-9. Fsync to ensure durability
-10. Clear `flush_in_progress` with Release semantics
-11. Attempt compaction if needed
-12. Release flush mutex
+1. Acquire flush mutex (serializes flushes, not appends)
+2. Swap active queue atomically (allows concurrent appends to continue)
+3. Dequeue records from inactive queue into ring buffer
+4. Check for segment rotation (size threshold exceeded)
+5. Flush ring buffer to file with 512-byte sector alignment
+6. Rotate segment if needed
+7. Update `flushed_lsn` with Release semantics
+8. fsync to ensure durability
+9. Release flush mutex
 
-**Ring Buffer Benefits:**
+**Key Design Properties:**
 
-- **Serial access:** Only flusher touches ring buffer (no concurrency issues)
-- **True circular buffer:** Power-of-2 sized with mask-based wraparound (no modulo)
-- **Alignment handling:** Rounds up to 512-byte boundary with zero padding
-- **Efficient writes:** Batches small records into 16KB chunks before `pwrite_all`
-- **No compaction needed:** Wraparound handled by mask operation
-
-**Memory Ordering:**
-
-- `flushed_lsn` writes use **Release** semantics (ensure all writes visible before update)
-- `flushed_lsn` reads use **Acquire** semantics (see all writes up to flushed LSN)
-
-**Key Properties:**
-
-- **Appends never block on flush:** Queue swap allows concurrent appends during flush
-- **Single flusher:** `flush_mutex` ensures only one flush at a time
-- **No buffer space races:** Swap threshold ensures in-flight writers can complete
-- **512-byte alignment:** Ring buffer handles alignment without per-flush padding overhead
-- **Torn write protection:** Sector-aligned writes ensure partial flushes are detectable during recovery
+- **Concurrent appends during flush:** Queue swap enables non-blocking append path
+- **Sector-aligned writes:** Ring buffer accumulates and pads to 512-byte boundaries
+- **Automatic rotation:** Triggered during flush when segment exceeds size limit
+- **Memory ordering:** Release/Acquire semantics ensure visibility of flushed records
+- **Torn write protection:** Aligned writes + checksums detect partial flushes
 
 ---
 
@@ -518,23 +503,23 @@ The WAL uses double-buffered MPSC queues to eliminate buffer space reservation r
 
 **IMPORTANT: LSN Ordering During Recovery**
 
-Records in the WAL file may be **physically out of LSN order** due to the lock-free append protocol where multiple threads assign LSNs independently and enqueue to MPSC queues. The iterator implementation **MUST enforce strict LSN ordering** when replaying records.
+Records in segment files may be **physically out of LSN order** due to the lock-free append protocol where multiple threads assign LSNs independently and enqueue to MPSC queues. The iterator implementation **MUST enforce strict LSN ordering** when replaying records.
 
 **Implementation:** Use a min-heap to read records in strict LSN order:
 
-- Read all records from file into heap (O(N log N) construction)
+- Read all records from segments into heap (O(N log N) construction)
 - Extract minimum LSN on each `wal_iter_next()` call (O(log N) per call)
 - Memory usage: O(N) where N = total records in WAL
 - Simpler than skip list, no indexing overhead, sufficient for recovery use case
 
 ### Generic Recovery Process
 
-1. **Open WAL file**
-   - Open `wal.log` and read file header
-   - Extract `min_lsn`, `max_lsn`, `safe_lsn` from header
+1. **Scan WAL directory for segments**
+   - Use `wal_list_segments()` to find all segment files
+   - Sort by segment number (ascending order)
 
 2. **Handle torn writes and corrupted records**
-   - If last record header is incomplete (< 56 bytes), discard it
+   - If last record header is incomplete (< 48 bytes), discard it
    - If `header_checksum` fails, discard record (corrupted header)
    - If `payload_checksum` fails, discard record (corrupted/incomplete payload)
    - Recovery gracefully handles partial writes at any position in log
@@ -542,13 +527,17 @@ Records in the WAL file may be **physically out of LSN order** due to the lock-f
 
 3. **Find recovery start point**
    - Application scans for last checkpoint record (user-defined type)
-   - Or starts from `min_lsn` for full recovery
+   - Or starts from LSN 0 for full recovery
 
 4. **Replay from start LSN (in strict LSN order)**
    - Create iterator with `wal_iter_create(start_lsn)`
-   - Iterator reads records from file and sorts by LSN internally
+   - Iterator reads records from segments and sorts by LSN internally
    - For each record (in LSN order), call user's `apply_fn` callback
    - User implements idempotency checking based on application semantics
+
+5. **Retire old segments** (optional)
+   - After recovery, call `wal_retire_segments(safe_lsn)`
+   - Deletes segments no longer needed for recovery
 
 ### User Responsibility: Idempotency
 
@@ -655,45 +644,105 @@ i32 apply_record(const WALRecordHeader *hdr, const void *payload, void *ctx) {
 
 ---
 
-## Compaction Protocol
+## Segment Lifecycle Management
 
-### Trigger
+### Rotation Strategy
 
-Compaction is automatically triggered after checkpoint. The `wal_checkpoint()` function:
+Segments rotate automatically when active segment reaches configured size limit (e.g., 1GB).
 
-- Writes checkpoint record with user-provided data
-- Sets `safe_lsn` to checkpoint LSN
-- Marks `compaction_needed = true`
-- Resets `compaction_retry_count = 0`
+**Rotation Process:**
 
-### Compaction Process
+1. Finalize current segment: update header with `max_lsn`, fsync file
+2. Close current segment file descriptor
+3. Create new segment with incremented number (`wal.XXXX`)
+4. Write new segment header with `min_lsn = next_lsn`
+5. fsync new segment and parent directory for metadata durability
+6. Continue appending to new segment
 
-Compaction runs during the next flush or close operation:
+**Directory fsync Requirement:** Both segment creation and header updates require directory fsync to ensure metadata persistence, preventing "missing file" errors after crashes.
 
-1. Acquire flush mutex (blocks other flushes, appends continue)
-2. Create temporary file `wal.log.compact`
-3. Write new header with `min_lsn = safe_lsn + 1`
-4. Copy all records where `lsn > safe_lsn` from old file
-5. Update new header with final `max_lsn` and `file_size`, compute checksum
-6. Fsync temporary file
-7. Atomic rename: `wal.log.compact` → `wal.log`
-8. Fsync directory for metadata durability
-9. Reopen file and reload header
-10. Release flush mutex
+**Shutdown Process:** Flush buffered records, update final `max_lsn` in segment header, fsync file and directory, close descriptor.
 
-**Key Properties:**
+### Retention Policies
 
-- **Appends continue:** Only flushes block during compaction (double-buffering handles this)
-- **Atomic replacement:** Old file valid until atomic rename
-- **Failure recovery:** If compaction fails, old file remains intact
-- **Retry logic:** Failed compactions retry on next flush/close (max retries)
+The WAL supports flexible segment retention policies to accommodate different use cases:
 
-### Compaction Retry Strategy
+```c
+// PUBLIC: Segment retention policy (C ABI compatible enum)
+enum WALRetentionMode {
+    WAL_RETAIN_NONE = 0,      // Delete segments after checkpoint (default)
+    WAL_RETAIN_ALL = 1,       // Never delete segments (in-memory KV use case)
+    WAL_RETAIN_LSN = 2,       // Keep segments covering last N LSNs
+    WAL_RETAIN_COUNT = 3,     // Keep last N segments
+};
 
-- Triggered in `wal_flush()` or `wal_close()` when `compaction_needed` is true
-- Max retries: 3-5 attempts
-- Retry on: Next flush, close, or explicit checkpoint
-- Failure handling: Log error, continue operation (old file still valid)
+// PUBLIC: Create WAL with retention policy
+WAL* wal_create_with_policy(const char *wal_dir,
+                             u32 buffer_size,
+                             u64 segment_max_size,
+                             enum WALRetentionMode mode,
+                             u64 retention_param);  // LSN range or count
+
+// PUBLIC: Simplified create (defaults to WAL_RETAIN_NONE)
+WAL* wal_create(const char *wal_dir, u32 buffer_size, u64 segment_max_size);
+
+// PUBLIC: Update retention policy at runtime
+i32 wal_set_retention(WAL *wal, enum WALRetentionMode mode, u64 param);
+
+// PUBLIC: Retire segments respecting retention policy
+i32 wal_retire_segments(WAL *wal, u64 safe_lsn);
+
+// PUBLIC: Manual cleanup (ignores retention policy)
+i32 wal_retire_segments_force(WAL *wal, u64 safe_lsn);
+```
+
+**Retention Mode Details:**
+
+1. **WAL_RETAIN_NONE (Default):** Delete segments immediately after checkpoint
+   - Use case: Traditional databases with page-based storage
+   - Segments deleted when `max_lsn < checkpoint_lsn`
+
+2. **WAL_RETAIN_ALL:** Never delete segments automatically
+   - Use case: In-memory KV stores where WAL is the only persistent state
+   - User must manually delete segments or implement compaction
+
+3. **WAL_RETAIN_LSN:** Keep segments covering last N LSNs
+   - Use case: Point-in-time recovery to recent states
+   - Deletes segments with `max_lsn < (current_lsn - retention_lsn_range)`
+   - Example: Keep last 1M LSNs for recovery to any recent operation
+
+4. **WAL_RETAIN_COUNT:** Keep last N segments
+   - Use case: Bounded storage with predictable disk usage
+   - Keeps N most recent segments regardless of LSN range
+   - Example: Keep last 10 segments (~10GB if 1GB each)
+
+**Usage Examples:**
+
+```c
+// In-memory KV store - keep all segments
+WAL *wal = wal_create_with_policy("/data/wal",
+                                   1024 * 1024,        // 1MB buffer
+                                   1024 * 1024 * 1024, // 1GB segments
+                                   WAL_RETAIN_ALL,
+                                   0);
+
+// Traditional database - delete after checkpoint
+WAL *wal = wal_create("/db/wal", 1024 * 1024, 1024 * 1024 * 1024);
+
+// Point-in-time recovery - keep last 1M LSNs
+WAL *wal = wal_create_with_policy("/db/wal",
+                                   1024 * 1024,
+                                   1024 * 1024 * 1024,
+                                   WAL_RETAIN_LSN,
+                                   1000000);
+
+// Bounded storage - keep last 10 segments
+WAL *wal = wal_create_with_policy("/db/wal",
+                                   1024 * 1024,
+                                   1024 * 1024 * 1024,
+                                   WAL_RETAIN_COUNT,
+                                   10);
+```
 
 ---
 
@@ -701,11 +750,11 @@ Compaction runs during the next flush or close operation:
 
 ### Write Amplification
 
-**Buffering:** Keep log records in memory buffer (double-buffered queues)
+**Buffering:** Keep log records in memory buffer (e.g., 1MB)
 
 - Amortize fsync cost across multiple records
 - Flush on:
-  - Buffer swap threshold (~90% full)
+  - Buffer full
   - Explicit flush request
   - Transaction commit
 
@@ -714,18 +763,18 @@ Compaction runs during the next flush or close operation:
 - Wait briefly for more transactions
 - Single fsync commits all of them
 
-### File Size Management
+### Segment Size Management
 
-**Target File Size:** 1GB (configurable via max_file_size hint)
+**Target Segment Size:** 1GB per segment (configurable)
 
-- Automatic compaction after checkpoint
-- Keeps file size bounded
-- No manual truncation needed
+- Automatic rotation when segment reaches limit
+- Keeps individual files manageable
+- No need for manual truncation
 
 **Checkpoint Frequency:** Application-defined
 
-- Typical: Every 100MB of log data or every N operations
-- Triggers compaction to reclaim space
+- Typical: Every 100MB of log data
+- Enables retirement of old segments
 - Bounds recovery time (only replay since last checkpoint)
 
 ---
@@ -750,7 +799,7 @@ u64 log_page_insert(WAL *wal, u32 page_id, const void *key, const void *value) {
 // Write-back protocol
 void flush_page(WAL *wal, Page *page) {
     // WAL protocol: log must be on disk before page
-    wal_flush(wal);
+    wal_flush(wal, page->page_lsn);
 
     // Now safe to write page to disk
     pwrite(db_fd, page->data, PAGE_SIZE, page->page_id * PAGE_SIZE);
@@ -773,7 +822,7 @@ void kv_put(WAL *wal, KVStore *store, const char *key, const char *value) {
     hashtable_insert(store->table, key, value);
 
     // Flush log (for durability)
-    wal_flush(wal);
+    wal_flush(wal, lsn);
 }
 
 // Recovery
@@ -809,7 +858,7 @@ u64 log_object_update(WAL *wal, u64 object_id, u64 offset, const void *data, u32
 
 // Flush protocol
 void flush_object(WAL *wal, Object *obj) {
-    wal_flush(wal);
+    wal_flush(wal, obj->last_lsn);
     fwrite(obj->data, obj->size, 1, obj->file);
     fsync(fileno(obj->file));
 }
@@ -826,7 +875,7 @@ The WAL provides full ACID transaction support with undo/redo recovery. Transact
 ### Reserved Record Types
 
 ```c
-// WAL library reserves top 4 type codes for transaction control
+// PUBLIC: WAL library reserves top 4 type codes for transaction control (C ABI compatible)
 #define WAL_TXN_BEGIN   0xFFFC  // Transaction begin marker
 #define WAL_TXN_COMMIT  0xFFFD  // Transaction commit
 #define WAL_TXN_ABORT   0xFFFE  // Transaction abort
@@ -836,11 +885,12 @@ The WAL provides full ACID transaction support with undo/redo recovery. Transact
 // Non-transactional records use txn_id = 0
 ```
 
-### Transaction Record Formats
+### Transaction Record Formats (C ABI Compatible)
 
 **Begin Record:**
 
 ```c
+// PUBLIC: Transaction begin payload (C ABI compatible)
 struct WALTxnBeginPayload {
     u64 timestamp;       // When transaction started (optional)
     u32 isolation_level; // User-defined isolation level (optional)
@@ -856,6 +906,7 @@ struct WALTxnBeginPayload {
 **Undo Record:**
 
 ```c
+// PUBLIC: Undo record payload (C ABI compatible)
 struct WALUndoRecordPayload {
     u64 original_lsn;    // LSN of the operation being undone
     u16 original_type;   // Original record type
@@ -863,10 +914,10 @@ struct WALUndoRecordPayload {
 };
 ```
 
-### Transaction API
+### Public Transaction API
 
 ```c
-// Transaction handle
+// OPAQUE: Transaction handle (users only interact via pointer)
 struct WALTxn {
     u32 txn_id;          // Unique transaction ID (never 0)
     u64 first_lsn;       // LSN of BEGIN record
@@ -945,20 +996,20 @@ void wal_txn_free(WALTxn *txn);
 - Avoids OOM on large logs (billions of records)
 - Suitable for constrained environments
 
-**Recovery API:**
+**Public Recovery API:**
 
 ```c
-// User-defined redo callback (applies forward operations)
+// PUBLIC: User-defined redo callback (applies forward operations)
 typedef i32 (*wal_redo_fn)(const struct WALRecordHeader *hdr,
                            const void *payload,
                            void *user_ctx);
 
-// User-defined undo callback (reverses operations)
+// PUBLIC: User-defined undo callback (reverses operations)
 typedef i32 (*wal_undo_fn)(const struct WALRecordHeader *hdr,
                            const void *payload,
                            void *user_ctx);
 
-// Recover with transaction support
+// PUBLIC: Recover with transaction support
 i32 wal_recover_txn(WAL *wal, u64 start_lsn,
                     wal_redo_fn redo_fn,
                     wal_undo_fn undo_fn,
@@ -1069,10 +1120,10 @@ By default, `wal_txn_commit()` ensures full durability:
 **Optional Durability Modes:**
 
 ```c
-// Synchronous commit (default) - full durability
+// PUBLIC: Synchronous commit (default) - full durability
 i32 wal_txn_commit(WALTxn *txn);
 
-// Async commit - returns before fsync (unsafe, for testing/benchmarking)
+// PUBLIC: Async commit - returns before fsync (unsafe, for testing/benchmarking)
 i32 wal_txn_commit_async(WALTxn *txn);
 ```
 
@@ -1091,14 +1142,15 @@ Async commits skip fsync, returning immediately after buffer write. This is **un
 
 ---
 
-## Optional Helper Utilities
+## Optional Helper Utilities (Public API)
 
 While idempotency is user-implemented, the WAL library can provide optional helpers to reduce boilerplate:
 
 ### Resource LSN Tracking
 
 ```c
-// Helper: track last applied LSN per resource
+// PUBLIC: Helper to track last applied LSN per resource
+// OPAQUE: Users only interact via pointer
 struct ResourceLSNMap;
 
 ResourceLSNMap* rmap_create(void);
@@ -1134,7 +1186,8 @@ i32 apply_with_idempotency(const WALRecordHeader *hdr, const void *payload, void
 ### Transaction LSN Set
 
 ```c
-// Helper: track applied transaction LSNs (Bloom filter or hash set)
+// PUBLIC: Helper to track applied transaction LSNs (Bloom filter or hash set)
+// OPAQUE: Users only interact via pointer
 struct TxnLSNSet;
 
 TxnLSNSet* txn_set_create(u64 estimated_size);
@@ -1180,10 +1233,9 @@ Stream WAL segments to replica:
 - **Idempotent recovery**: User implements checking based on application semantics
 - **Independent system**: Self-contained library with no external dependencies
 - **Lock-free append**: Double-buffered design with atomic cursor for high concurrency
-- **Single-file storage**: Append-only file with automatic compaction after checkpoint
+- **Segment-based storage**: Bounded file sizes, simple retirement after checkpoint
 - **Flexible integration**: Callback-based recovery supports various storage models
 - **Full ACID transactions**: Transaction support with undo/redo recovery and prev_lsn chains
-- **Simplified API**: Clean separation between transactional and non-transactional operations
 
 **Architecture:**
 
@@ -1204,7 +1256,7 @@ Stream WAL segments to replica:
 │                                          │
 │  - Lock-free wal_append()                │
 │  - Double-buffered flush                 │
-│  - Automatic compaction                  │
+│  - Segment rotation & retirement         │
 │  - Recovery via callback iteration       │
 └──────────────────────────────────────────┘
 ```
