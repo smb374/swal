@@ -119,8 +119,8 @@ pub const WALCtx = struct {
         ctx.allocator = allocator;
 
         ctx.epoch = atomic.Value(u64).init(0);
-        ctx.active_writers[0] = atomic.Value(u64).init(0);
-        ctx.active_writers[1] = atomic.Value(u64).init(0);
+        ctx.active_writers[0] = atomic.Value(u32).init(0);
+        ctx.active_writers[1] = atomic.Value(u32).init(0);
         ctx.queues[0] = try queue.MPSCQueue(WAL_QUEUE_SIZE).init(allocator);
         errdefer ctx.queues[0].deinit();
         ctx.queues[1] = try queue.MPSCQueue(WAL_QUEUE_SIZE).init(allocator);
@@ -139,7 +139,7 @@ pub const WALCtx = struct {
 
         ctx.dir = try std.fs.cwd().openDir(config.dir, .{});
         errdefer ctx.dir.close();
-        const f = ctx.create_segment(0);
+        const f = try ctx.create_segment(0);
         ctx.active_f = f;
         ctx.active_shdr.* = ctx.default_seg_header();
 

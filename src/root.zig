@@ -4,6 +4,8 @@ pub const ctx = @import("ctx.zig");
 pub const queue = @import("queue.zig");
 pub const record = @import("record.zig");
 pub const utils = @import("utils.zig");
+pub const config = @import("config.zig");
+pub const ringbuf = @import("ringbuf.zig");
 
 pub fn bufferedPrint() !void {
     // Stdout is for the actual output of your application, for example if you
