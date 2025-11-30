@@ -1,5 +1,9 @@
 //! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
+pub const ctx = @import("ctx.zig");
+pub const queue = @import("queue.zig");
+pub const record = @import("record.zig");
+pub const utils = @import("utils.zig");
 
 pub fn bufferedPrint() !void {
     // Stdout is for the actual output of your application, for example if you
@@ -20,4 +24,8 @@ pub fn add(a: i32, b: i32) i32 {
 
 test "basic add functionality" {
     try std.testing.expect(add(3, 7) == 10);
+}
+
+comptime {
+    std.testing.refAllDeclsRecursive(@This());
 }

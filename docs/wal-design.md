@@ -282,15 +282,22 @@ struct WAL {
     i32 active_fd;                      // File descriptor for active segment
     i32 dirfd;                          // Directory FD for openat()
     u32 segment_num;                    // Current segment number
-    u64 segment_max_size;               // Max segment size before rotation (e.g., 1GB)
+    u64 segment_max_size;               // Max segment size before rotation (soft limit, see note)
     u8 payload_hash_type;               // Default payload hash (0=xxHash64, 1=BLAKE2s)
     char *wal_dir;                      // Directory containing segment files
     struct WALSegmentHeader *active_shdr; // Cached active segment header (heap-allocated)
 
-    // Double-buffered MPSC queues (hold heap-allocated records)
-    void *buffers[2];                   // Two queues for ping-pong (capacity: WAL_RECORDS)
-    atomic_u32 active_idx;              // Which queue is active (0 or 1)
-    atomic_u32 active_writers[2];       // Count of threads writing to each queue
+    // Double-buffered write buffers (arena + queue pairs)
+    // Each WriteBuffer contains:
+    //   - ArenaAllocator: Bulk allocates records for a flush batch
+    //   - MPSCQueue: Holds pointers into the arena
+    // Benefits: Eliminates malloc lock contention, bulk-free on flush
+    struct WriteBuffer {
+        void *arena;                    // ArenaAllocator (Zig std.heap.ArenaAllocator)
+        void *queue;                    // MPSC queue storing arena pointers
+    } buffers[2];
+    atomic_u32 active_idx;              // Which buffer is active (0 or 1)
+    atomic_u32 active_writers[2];       // Count of threads writing to each buffer
     u32 buffer_size;                    // Deprecated (use WAL_RECORDS instead)
 
     // Ring buffer for aligned writes (serial, flusher-only)
@@ -314,6 +321,9 @@ struct WAL {
     };
 };
 
+// Note: segment_max_size is a "soft limit" - a single flush batch may exceed this
+// limit, but rotation occurs afterward. This ensures records are never split across files.
+
 // OPAQUE: Transaction handle - used for transactional operations
 struct WALTxn;
 
@@ -323,20 +333,22 @@ struct WALIterator;
 
 **Implementation Architecture:**
 
-The WAL implementation uses several key design patterns (implementation details in Zig):
+The WAL implementation uses several key design patterns (implemented in Zig):
 
-- **Double-buffered MPSC queues:** Enable lock-free append while flushing
-  - Heap-allocated records avoid size limits
+- **Double-buffered Arena + MPSC queues:** Enable lock-free append while flushing
+  - Arena allocator (`std.heap.ArenaAllocator`) eliminates malloc contention
+  - Queue stores pointers into arena (not heap-allocated records)
   - Capacity: 8192 slots, swap at ~90% to prevent write failures
+  - Bulk-free on flush (arena reset), zero fragmentation
   - Atomic operations for multi-producer, single-consumer flusher
 
 - **Ring buffer:** Handles 512-byte sector alignment for durability
   - Power-of-2 sizing with mask-based wraparound
   - Serial access (flusher only), no concurrency overhead
-  - Zero-padding to sector boundaries prevents torn writes
+  - Zero-padding to sector boundaries with overwrite strategy
 
 - **Lock-free append:** Maximizes throughput for concurrent writers
-  - Atomic LSN assignment + MPSC enqueue (no locks)
+  - Atomic LSN assignment + arena allocation + MPSC enqueue (no locks)
   - All-or-nothing enqueue prevents partial record corruption
 
 - **Stateless recovery:** No separate state files needed
@@ -344,13 +356,31 @@ The WAL implementation uses several key design patterns (implementation details 
   - Scan directory to rebuild WAL state on startup
   - Absolute segment numbering simplifies ordering
 
-- **Automatic rotation:** Triggered when segment reaches size limit
+- **Soft-limit rotation:** Triggered after flush when segment exceeds size
+  - Records never split across files (simplifies recovery)
   - Keeps files manageable for filesystem operations
   - Enables clean retirement after checkpoints
+
+- **Zig-specific details:**
+  - Little-endian encoding: `std.mem.writeInt(..., .little)` for portability
+  - Error handling: Map Zig errors to C integer codes (0=success, -1/-2/-3=errors)
+  - Opaque handles: `export const WAL = opaque {}` hides implementation from C
 
 ### Public Core Operations
 
 ```c
+// Error codes returned by WAL functions (C ABI compatible)
+#define WAL_OK              0   // Success
+#define WAL_ERR_GENERIC    -1   // Generic error
+#define WAL_ERR_LSN_GAP    -2   // LSN gap detected during iteration
+#define WAL_ERR_CHECKSUM   -3   // Checksum failure (corrupted record)
+
+// Scatter-gather vector for vectorized append (C ABI compatible)
+struct WALIoVec {
+    const void *base;       // Pointer to data buffer
+    size_t len;             // Length of data in bytes
+};
+
 // Create new WAL directory with initial segment
 // wal_dir: directory to store segment files (e.g., "/data/wal")
 // buffer_size: deprecated (uses WAL_RECORDS = 8192 internally)
@@ -371,9 +401,18 @@ WAL* wal_open(const char *wal_dir);
 u64 wal_append(WAL *wal, u64 resource_id, u16 record_type,
                const void *payload, u16 payload_len);
 
-// Force WAL to disk up to specified LSN (blocks until fsync completes)
-// Triggers buffer swap and writes inactive buffer to disk
-i32 wal_flush(WAL *wal, u64 up_to_lsn);
+// Vectorized append - accepts scatter-gather buffers (lock-free, non-blocking)
+// Flattens iovecs into a single contiguous record in the arena
+// The WAL does NOT retain pointers to iovec data after this call returns
+// Use this to avoid memcpy when key/value are in separate buffers
+// For transactional appends, use wal_txn_append_v() instead
+// Returns LSN assigned to this record
+u64 wal_append_v(WAL *wal, u64 resource_id, u16 record_type,
+                 const struct WALIoVec *iovs, int iovcnt);
+
+// Force WAL to disk (blocks until fsync completes)
+// Triggers buffer swap and writes all records from inactive buffer to disk
+i32 wal_flush(WAL *wal);
 
 // Close WAL (flushes any buffered records, updates segment header)
 void wal_close(WAL *wal);
@@ -393,9 +432,15 @@ struct WALIterator;
 // Memory usage: O(N) where N = total records in WAL
 WALIterator* wal_iter_create(WAL *wal, u64 start_lsn);
 
-// Get next record (returns 0 on success, -1 when no more records)
+// Get next record with LSN gap detection
+// Returns:
+//   0: Success - record retrieved
+//  -1: No more records (end of WAL)
+//  -2: LSN gap detected (current LSN != previous LSN + 1)
+//  -3: Checksum failure (corrupted record)
 // Extracts minimum LSN from heap, guarantees LSN ordering
 // Caller receives pointer to record (valid until next call or destroy)
+// On LSN gap (-2): Application can choose to call next() again to skip gap, or abort
 i32 wal_iter_next(WALIterator *it, const struct WALRecordHeader **out_hdr,
                   const void **out_payload);
 
@@ -446,48 +491,68 @@ The WAL uses double-buffered MPSC queues to eliminate buffer space reservation r
 **Append Phases:**
 
 1. **Assign LSN:** `lsn = atomic_fetch_add(&wal->next_lsn, 1, ACQ_REL)`
-2. **Allocate record on heap:** `record = malloc(sizeof(header) + payload_len)`
+2. **Allocate record in arena:** `record = active_buffer.arena.allocator().alloc(sizeof(header) + payload_len)`
+   - Uses current active buffer's ArenaAllocator
+   - No malloc locks, no system allocator contention
+   - All records for this flush batch allocated from same arena
 3. **Build complete record:**
    - Fill header fields (LSN, resource_id, record_type, etc.)
-   - Copy payload data
+   - Copy payload data (or flatten iovecs for `wal_append_v`)
    - Compute checksums (CRC-32C for header, xxHash64/BLAKE2s for payload)
-4. **Enqueue to active MPSC queue:** `q_put(&wal->queues[active_idx], record, &queue_idx)`
+4. **Enqueue to active MPSC queue:** `q_put(&active_buffer.queue, record)`
+   - Queue stores pointers into the arena
 5. **Check swap threshold:** If `queue->count >= swap_threshold` (80-90% of max_records), trigger flush
 
 **Swap Threshold Design:**
 
-- Queue capacity: `max_records` (e.g., 64K)
-- Swap threshold: `0.8 * max_records` to `0.9 * max_records` (51.2K - 57.6K)
-- Headroom: 6.4K - 12.8K slots reserved for in-flight writers
+- Queue capacity: `WAL_RECORDS` (8192 slots)
+- Swap threshold: `~90%` (7372 slots)
+- Headroom: ~10% slots reserved for in-flight writers
 - **Prevents write failures:** Writers that started before swap can always complete
 
-**Memory Management:**
+**Memory Management (Arena-Based):**
 
-- Records heap-allocated during append (`malloc`)
-- Queue stores `void*` pointers to records
-- Flusher frees records after copying to ring buffer
-- Simple, correct ownership: WAL owns record from enqueue until flush completes
+- Records allocated from ArenaAllocator during append (no malloc)
+- Queue stores pointers into the arena
+- Flusher copies records to ring buffer, then **bulk-frees** entire arena
+- Zero fragmentation, no per-record free overhead
+- Simple, correct ownership: WAL owns arena from swap until flush completes
 
 **Key Properties:**
 
 - **Lock-free append:** Only atomic LSN assignment + MPSC enqueue
+- **No allocator contention:** Arena allocations avoid malloc locks
 - **No buffer space races:** Enqueue is atomic (all-or-nothing)
 - **No torn records:** Complete record enqueued before swap can occur
-- **Variable-size records:** Heap allocation handles any size
+- **Variable-size records:** Arena allocation handles any size
+- **Bulk deallocation:** Arena reset frees all records at once
 
 ### Flush Protocol
 
 **High-Level Phases:**
 
 1. Acquire flush mutex (serializes flushes, not appends)
-2. Swap active queue atomically (allows concurrent appends to continue)
-3. Dequeue records from inactive queue into ring buffer
+2. Swap active buffer index atomically (allows concurrent appends to continue)
+3. Dequeue records from inactive buffer's queue into ring buffer
 4. Check for segment rotation (size threshold exceeded)
 5. Flush ring buffer to file with 512-byte sector alignment
-6. Rotate segment if needed
-7. Update `flushed_lsn` with Release semantics
-8. fsync to ensure durability
-9. Release flush mutex
+6. **Reset inactive arena** (bulk-free all records: `arena.deinit()` + re-init or custom reset)
+7. Rotate segment if needed (soft limit check)
+8. Update `flushed_lsn` with Release semantics
+9. fsync to ensure durability
+10. Release flush mutex
+
+**Dirty Tail Strategy (Padding & Overwrite):**
+
+The WAL uses sector-aligned writes with intelligent padding to avoid `O_DIRECT` complexity:
+
+1. **512-byte alignment:** Ring buffer accumulates records and pads to sector boundaries
+2. **Zero padding:** End of file contains zeros to next 512-byte boundary
+3. **Overwrite on next flush:** Subsequent writes use `pwrite` to overwrite the padding
+4. **Safety mechanism:** Checksums (CRC-32C header + payload hash) are the sole source of truth
+   - If a crash occurs during overwrite, checksums fail
+   - Recovery detects torn write at tail and discards partial record
+   - Valid checksums = valid record (ignore trailing padding)
 
 **Key Design Properties:**
 
@@ -495,7 +560,7 @@ The WAL uses double-buffered MPSC queues to eliminate buffer space reservation r
 - **Sector-aligned writes:** Ring buffer accumulates and pads to 512-byte boundaries
 - **Automatic rotation:** Triggered during flush when segment exceeds size limit
 - **Memory ordering:** Release/Acquire semantics ensure visibility of flushed records
-- **Torn write protection:** Aligned writes + checksums detect partial flushes
+- **Torn write protection:** Double-checksum design (header + payload) detects corruption
 
 ---
 
@@ -511,6 +576,15 @@ Records in segment files may be **physically out of LSN order** due to the lock-
 - Extract minimum LSN on each `wal_iter_next()` call (O(log N) per call)
 - Memory usage: O(N) where N = total records in WAL
 - Simpler than skip list, no indexing overhead, sufficient for recovery use case
+
+**LSN Gap Detection:**
+
+The iterator tracks the expected next LSN and detects gaps:
+
+- On each `wal_iter_next()`: check if `current_lsn == expected_lsn`
+- If `current_lsn > expected_lsn`: return `WAL_ERR_LSN_GAP (-2)`
+- Application decides if gap is fatal (data loss) or expected (e.g., log truncation in distributed consensus)
+- User can call `next()` again to skip the gap and continue, or abort recovery
 
 ### Generic Recovery Process
 
@@ -648,16 +722,26 @@ i32 apply_record(const WALRecordHeader *hdr, const void *payload, void *ctx) {
 
 ### Rotation Strategy
 
-Segments rotate automatically when active segment reaches configured size limit (e.g., 1GB).
+Segments use a **soft limit** approach for rotation to ensure records are never split across files.
+
+**Soft Limit Behavior:**
+
+- `segment_max_size` (e.g., 1GB) is a target, not a hard boundary
+- A single flush batch is allowed to push the file size **over** the limit
+- Rotation occurs **after** the flush completes, not during
+- **Guarantee:** Records are never split across segment files (simplifies recovery)
+- **Constraint:** Individual records must not exceed `segment_max_size` (sanity check)
 
 **Rotation Process:**
 
-1. Finalize current segment: update header with `max_lsn`, fsync file
-2. Close current segment file descriptor
-3. Create new segment with incremented number (`wal.XXXX`)
-4. Write new segment header with `min_lsn = next_lsn`
-5. fsync new segment and parent directory for metadata durability
-6. Continue appending to new segment
+1. During flush: write all records from inactive buffer to current segment
+2. After flush: if `segment_size > segment_max_size`, trigger rotation
+3. Finalize current segment: update header with `max_lsn`, fsync file
+4. Close current segment file descriptor
+5. Create new segment with incremented number (`wal.XXXX`)
+6. Write new segment header with `min_lsn = next_lsn`
+7. fsync new segment and parent directory for metadata durability
+8. Continue appending to new segment
 
 **Directory fsync Requirement:** Both segment creation and header updates require directory fsync to ensure metadata persistence, preventing "missing file" errors after crashes.
 
@@ -799,7 +883,7 @@ u64 log_page_insert(WAL *wal, u32 page_id, const void *key, const void *value) {
 // Write-back protocol
 void flush_page(WAL *wal, Page *page) {
     // WAL protocol: log must be on disk before page
-    wal_flush(wal, page->page_lsn);
+    wal_flush(wal);
 
     // Now safe to write page to disk
     pwrite(db_fd, page->data, PAGE_SIZE, page->page_id * PAGE_SIZE);
@@ -822,7 +906,7 @@ void kv_put(WAL *wal, KVStore *store, const char *key, const char *value) {
     hashtable_insert(store->table, key, value);
 
     // Flush log (for durability)
-    wal_flush(wal, lsn);
+    wal_flush(wal);
 }
 
 // Recovery
@@ -858,7 +942,7 @@ u64 log_object_update(WAL *wal, u64 object_id, u64 offset, const void *data, u32
 
 // Flush protocol
 void flush_object(WAL *wal, Object *obj) {
-    wal_flush(wal, obj->last_lsn);
+    wal_flush(wal);
     fwrite(obj->data, obj->size, 1, obj->file);
     fsync(fileno(obj->file));
 }
@@ -935,6 +1019,12 @@ WALTxn* wal_txn_begin(WAL *wal);
 // Returns LSN of the appended record
 u64 wal_txn_append(WALTxn *txn, u64 resource_id, u16 record_type,
                    const void *payload, u16 payload_len);
+
+// Vectorized append within transaction
+// Flattens iovecs into a single contiguous record in the arena
+// Returns LSN of the appended record
+u64 wal_txn_append_v(WALTxn *txn, u64 resource_id, u16 record_type,
+                     const struct WALIoVec *iovs, int iovcnt);
 
 // Append with undo information
 // User provides undo data that can reverse this operation
