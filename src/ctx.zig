@@ -114,7 +114,7 @@ pub const WALCtx = struct {
         ctx.active_shdr = try allocator.create(WALSegmentHeader);
         errdefer allocator.destroy(ctx.active_shdr);
         ctx.segment_max_size = config.segment_max_size;
-        ctx.payload_hash_type = config.payload_hsah_type;
+        ctx.payload_hash_type = config.payload_hash_type;
         ctx.retention = config.retention;
         ctx.allocator = allocator;
 
